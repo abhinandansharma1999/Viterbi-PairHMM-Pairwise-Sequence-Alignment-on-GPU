@@ -26,7 +26,7 @@ Like before, we will be using UC San Diego's Data Science/Machine Learning Platf
 
 To get set up with Assignment 2, please follow the steps below:
 
-1. Open and accept the following GitHub Classroom invitation link for assignments 2 through your GitHub account: [https://classroom.github.com/a/7heevtuT](https://classroom.github.com/a/7heevtuT). A new repository for this will be created specifically for your account (e.g. https://github.com/ECE213-WI26/assgn2-yatisht) and an email will be sent to you via GitHub with the details. 
+1. Open and accept the following GitHub Classroom invitation link for assignments 2 through your GitHub account: [https://classroom.github.com/a/zd3UrbhA](https://classroom.github.com/a/zd3UrbhA). A new repository for this will be created specifically for your account (e.g. https://github.com/ECE213-WI26/assgn2-yatisht) and an email will be sent to you via GitHub with the details. 
 
 2. SSH into the DSMLP server (dsmlp-login.ucsd.edu) using the AD account. I recommend using PUTTY SSH client (putty.org) or Windows Subsystem for Linux (WSL) for Windows (https://docs.microsoft.com/en-us/windows/wsl/install-manual). MacOS and Linux users can SSH into the server using the following command (replace `yturakhia` with your username)
 
