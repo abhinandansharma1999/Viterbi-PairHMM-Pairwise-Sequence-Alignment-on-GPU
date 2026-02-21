@@ -4,6 +4,13 @@
 #include <algorithm>
 #include <fstream>
 
+#include <cuda_runtime.h>
+#include <cuda.h>
+
+#if __CUDA_ARCH__ >= 900
+#include <cuda/dpx_intrinsics.h>
+#endif
+
 /**
  * Allocates GPU memory for sequences, lengths, and traceback paths.
  * Calculates 'longestLen' to determine the stride for flattening the sequence array.
@@ -141,8 +148,10 @@ __global__ void alignmentOnGPU (
     
     // GACT Parameters
     // TODO: Adjust the tile size and overlap region to explore the tradeoff between speed and accuracy
-    const int T = 10;        // Tile size
-    const int O = 3;         // Overlap between tiles
+    const int T = 200;        // Tile size
+    const int O = 64;         // Overlap between tiles
+
+    const int BLOCK_SIZE = 256;
     
     // Scoring Scheme (DO NOT MODIFY)
     const int16_t MATCH = 2;
@@ -168,224 +177,303 @@ __global__ void alignmentOnGPU (
 
     // State variables
     __shared__ bool lastTile;
-    __shared__ int16_t maxScore;
-    __shared__ int32_t best_ti;
-    __shared__ int32_t best_tj;
+    __shared__ int16_t tileStartScore;  // carries best overlap score into next tile's origin cell
+
+    __shared__ int s_maxScore[BLOCK_SIZE];
+    __shared__ int s_best_i[BLOCK_SIZE];
+    __shared__ int s_best_j[BLOCK_SIZE];
 
     // HINT: Use shared memory to store the reference and query segments involved in the tile
-    // __shared__ char shared_ref[??];
-    // __shared__ char shared_qry[??];
+    __shared__ char shared_ref[T];
+    __shared__ char shared_qry[T];
 
-    if (bx == 0 && tx == 0) {
-        
-        int32_t numPairs = d_info[0];
-        int32_t maxSeqLen = d_info[1]; 
+    // Shared state needed across threads within a tile
+    __shared__ int32_t sh_localLen;
+    __shared__ int32_t sh_currentPairPathLen;
+    __shared__ int32_t sh_reference_idx;
+    __shared__ int32_t sh_query_idx;
+    __shared__ int32_t sh_next_ref_advance;
+    __shared__ int32_t sh_next_qry_advance;
 
-        // Iterate over every pair of sequences
-        // TODO: Parallelize – assign one block per alignment pair
-        for (int pair = 0; pair < numPairs; ++pair) {
-            
-            // --- Initialization per Pair ---
-            // HINT:
-            // Think carefully,
-            // 1. Should these variables be stored in registers or shared memory?
-            //    (feel free to modify the baseline code)
-            // 2. How many threads are needed to initialize shared memory efficiently?
-            // 3. Should __syncthreads() be added after initialization?
-            lastTile = false;
-            maxScore = 0;
-            int32_t currentPairPathLen = 0; 
-            int32_t reference_idx = 0; 
-            int32_t query_idx = 0;  
+    // int32_t numPairs = d_info[0];
+    int32_t maxSeqLen = d_info[1]; 
 
-            // Calculate memory offsets for this pair
-            int32_t refStart = (pair * 2) * maxSeqLen;
-            int32_t qryStart = (pair * 2 + 1) * maxSeqLen;
-            int32_t tbGlobalOffset = pair * (maxSeqLen * 2); 
-            
-            int32_t refTotalLen = d_seqLen[2 * pair];
-            int32_t qryTotalLen = d_seqLen[2 * pair + 1];
-               
-            
-            // -------------------------------------------------------
-            // TILE LOOP: Align the sequence tile by tile
-            // -------------------------------------------------------
-            while (!lastTile) {
-                // Determine Tile Size (Clip to sequence end)
-                int32_t refLen = min(T, refTotalLen - reference_idx); 
-                int32_t qryLen = min(T, qryTotalLen - query_idx); 
-                
-                // Check termination conditions
-                // HINT:
-                // 1. How many threads are needed here?
-                if ((reference_idx + refLen == refTotalLen) && (query_idx + qryLen == qryTotalLen)) lastTile = true;
+    // Iterate over every pair of sequences
+    // TODO: Parallelize – assign one block per alignment pair
+    int pair = bx;
+    
+    // --- Initialization per Pair ---
+    // HINT:
+    // Think carefully,
+    // 1. Should these variables be stored in registers or shared memory?
+    //    (feel free to modify the baseline code)
+    // 2. How many threads are needed to initialize shared memory efficiently?
+    // 3. Should __syncthreads() be added after initialization?
 
-                // Reset Wavefront Scores (approx -infinity)
-                // HINT: 
-                // 1. How many threads are needed to efficiently initialize wf_scores?
-                // 2. Is the initialization really necessary, or can it be omitted?
-                for (int s = 0; s < 3 * (T + 1); ++s) wf_scores[s] = -9999;
-                
-                // Reset Max Score Tracking (for finding optimal overlap exit)
-                best_ti = refLen; 
-                best_tj = qryLen;
-
-                // TODO: Load the reference and query segments from global memory into shared memory
-                // HINT: Using memory coalescing
-                // for (int s = ??; s < ??; s += ??) shared_ref[s] = d_seqs[??];
-                // for (int s = ??; s < ??; s += ??) shared_qry[s] = d_seqs[??];
-
-                
-
-                // ---------------------------------------------------
-                // WAVEFRONT SCORING LOOP (Diagonal Traversal)
-                // ---------------------------------------------------
-                for (int k = 0; k <= refLen + qryLen; ++k) {
-                    
-                    // Cyclic buffers for 3-wavefront dependency
-                    int curr_k   = (k % 3) * (T + 1);
-                    int pre_k    = ((k + 2) % 3) * (T + 1);
-                    int prepre_k = ((k + 1) % 3) * (T + 1);
-
-                    // Compute loop bounds for this diagonal
-                    int i_start = max(0, k - qryLen);
-                    int i_end   = min(refLen, k);
-
-                    // TODO: Implement wavefront parallelism
-                    // HINT: 
-                    // 1. Assign each thread to a cell on the wavefront
-                    // 2. What is the maximum possible length of wavefront? 
-                    //    Can we always set blockSize to avoid situations 
-                    //    where the wavefront size exceeds the number of available block threads?
-                    for (int i = i_start; i <= i_end; ++i) {
-                        int j = k - i; 
-                        
-                        int16_t score = -9999;
-                        uint8_t direction = DIR_DIAG;
-
-                        // -- Boundary Conditions --
-                        if (i == 0 && j == 0) {
-                            score = maxScore; // Score from the previous tile
-                            maxScore = -9999; // reset max score
-                        } 
-                        else if (i == 0) {
-                            score = wf_scores[pre_k + i] + GAP; // Gap from Left
-                            direction = DIR_LEFT;
-                        } 
-                        else if (j == 0) {
-                            score = wf_scores[pre_k + (i - 1)] + GAP; // Gap from Up
-                            direction = DIR_UP;
-                        } 
-                        else {
-                            // -- Inner Matrix Calculation --
-                            // TODO: Replace this global memory access with shared memory
-                            char r_char = d_seqs[refStart + reference_idx + (i - 1)];
-                            char q_char = d_seqs[qryStart + query_idx + (j - 1)];
-                            
-                            int16_t score_diag = wf_scores[prepre_k + (i - 1)] + (r_char == q_char ? MATCH : MISMATCH);
-                            int16_t score_up   = wf_scores[pre_k + (i - 1)] + GAP;
-                            int16_t score_left = wf_scores[pre_k + i] + GAP;
-                        
-                            // Find Max (BONUS: Replace with DPX instructions)
-                            score = score_diag;
-                            direction = DIR_DIAG;
-                            
-                            if (score_up > score) { 
-                                score = score_up; 
-                                direction = DIR_UP; 
-                            }
-                            if (score_left > score) { 
-                                score = score_left; 
-                                direction = DIR_LEFT; 
-                            }
-                        }
-
-                        // Write Score
-                        wf_scores[curr_k + i] = score;
-                        
-                        // Write Direction (Only for inner cells, shifted index)
-                        if (i > 0 && j > 0) {
-                             tbDir[(i - 1) * T + (j - 1)] = direction;
-                        }
-
-                        // -- GACT Overlap Logic --
-                        // Track the highest score in the overlap region (past T-O)
-                        // TODO: Compute the max score and its indices for cells in the overlap region
-                        // Sequentially, max score can be updated during iteration.
-                        // For parallel execution, think about how to handle this safely.
-                        // HINT: Parallel Reduction
-                        if (!lastTile) {
-                            if (i > (refLen - O) && j > (qryLen - O)) {
-                               if (score >= maxScore) {
-                                   maxScore = score;
-                                   best_ti = i;
-                                   best_tj = j;
-                               }
-                            }
-                        }                    
-                    }
-                } // End Wavefront Loop
-
-                // ---------------------------------------------------
-                // TRACEBACK & REVERSAL
-                // ---------------------------------------------------
-                // HINT:
-                // 1. How many threads should be used for the traceback?
-                // 2. Consider carefully whether the variable should be stored in registers or shared memory.
-
-                // Determine where to start traceback (Overlap heuristic vs End of Tile)
-                int ti = (!lastTile) ? best_ti : refLen;
-                int tj = (!lastTile) ? best_tj : qryLen;
-
-                // Determine how much we advanced in this tile
-                int next_ref_advance = ti;
-                int next_qry_advance = tj;
-
-                // Traceback Backwards (End -> Start) into Shared Memory
-                int localLen = 0;
-                
-                while (ti > 0 || tj > 0) {
-                    uint8_t dir;
-
-                    // Implicit boundary handling for top/left edges
-                    if (ti == 0) { 
-                        dir = DIR_LEFT; 
-                    } else if (tj == 0) { 
-                        dir = DIR_UP;   
-                    } else {
-                        // Fetch direction from DP table
-                        dir = tbDir[(ti - 1) * T + (tj - 1)];
-                    }
-
-                    // Store to local temporary buffer
-                    localPath[localLen] = dir;
-                    localLen++;
-                    
-                    // Move coordinates
-                    if (dir == DIR_DIAG) { ti--; tj--; } 
-                    else if (dir == DIR_UP) { ti--; } 
-                    else { tj--; }
-                }
-
-                // Write Forward (Start -> End) to Global Memory
-                // Reverses the local path so the CPU gets it in forward order
-                // TODO: Use memory coalescing to efficiently write the data to global memory
-                for (int k = localLen - 1; k >= 0; --k) {
-                    d_tb[tbGlobalOffset + currentPairPathLen] = localPath[k];
-                    currentPairPathLen++;
-                }
-                
-                // ---------------------------------------------------
-                // ADVANCE TO NEXT TILE
-                // ---------------------------------------------------
-                reference_idx += next_ref_advance;
-                query_idx     += next_qry_advance;
-
-            } // End Tile Loop
-            // HINT: Is __syncthreads() needed after each tile?
-        } // End Pair Loop
-        // HINT: Is __syncthreads() needed after each alignment?
+    if (tx == 0) {
+        lastTile = false;
+        tileStartScore = 0;
+        sh_currentPairPathLen = 0;
+        sh_reference_idx = 0;
+        sh_query_idx = 0;
     }
+    __syncthreads();
+
+    // Calculate memory offsets for this pair
+    int32_t refStart = (pair * 2) * maxSeqLen;
+    int32_t qryStart = (pair * 2 + 1) * maxSeqLen;
+    int32_t tbGlobalOffset = pair * (maxSeqLen * 2); 
+    
+    int32_t refTotalLen = d_seqLen[2 * pair];
+    int32_t qryTotalLen = d_seqLen[2 * pair + 1];
+       
+    
+    // -------------------------------------------------------
+    // TILE LOOP: Align the sequence tile by tile
+    // -------------------------------------------------------
+    while (!lastTile) {
+        
+        // Register-local copies of shared indices for this tile iteration
+        int32_t reference_idx = sh_reference_idx;
+        int32_t query_idx     = sh_query_idx;
+
+        // Determine Tile Size (Clip to sequence end)
+        int32_t refLen = min(T, refTotalLen - reference_idx); 
+        int32_t qryLen = min(T, qryTotalLen - query_idx); 
+        
+        // Check termination conditions
+        // HINT:
+        // 1. How many threads are needed here?
+        if (tx == 0) {
+            if ((reference_idx + refLen == refTotalLen) && (query_idx + qryLen == qryTotalLen)) lastTile = true;
+        }
+
+        // Reset Wavefront Scores (approx -infinity)
+        // HINT: 
+        // 1. How many threads are needed to efficiently initialize wf_scores?
+        // 2. Is the initialization really necessary, or can it be omitted?
+        for (int s = tx; s < 3 * (T + 1); s += blockDim.x) wf_scores[s] = -9999;
+        
+        __syncthreads();
+
+        // TODO: Load the reference and query segments from global memory into shared memory
+        // HINT: Using memory coalescing
+        for (int s = tx; s < refLen; s += blockDim.x) shared_ref[s] = d_seqs[refStart + reference_idx + s];
+        for (int s = tx; s < qryLen; s += blockDim.x) shared_qry[s] = d_seqs[qryStart + query_idx + s];
+
+        __syncthreads();
+
+        // Per-thread local variables for tracking overlap max score
+        // during the wavefront loop. Accumulated into registers (fast, no contention),
+        // then reduced into shared memory after the wavefront loop completes.
+        int localMaxScore = -9999;
+        int localBest_i = -1;
+        int localBest_j = -1;
+        
+
+        // ---------------------------------------------------
+        // WAVEFRONT SCORING LOOP (Diagonal Traversal)
+        // ---------------------------------------------------
+        for (int k = 0; k <= refLen + qryLen; ++k) {
+            
+            // Cyclic buffers for 3-wavefront dependency
+            int curr_k   = (k % 3) * (T + 1);
+            int pre_k    = ((k + 2) % 3) * (T + 1);
+            int prepre_k = ((k + 1) % 3) * (T + 1);
+
+            // Compute loop bounds for this diagonal
+            int i_start = max(0, k - qryLen);
+            int i_end   = min(refLen, k);
+
+            // TODO: Implement wavefront parallelism
+            // HINT: 
+            // 1. Assign each thread to a cell on the wavefront
+            // 2. What is the maximum possible length of wavefront? 
+            //    Can we always set blockSize to avoid situations 
+            //    where the wavefront size exceeds the number of available block threads?
+            for (int i = i_start + tx; i <= i_end; i += blockDim.x) {
+                int j = k - i; 
+                
+                int16_t score = -9999;
+                uint8_t direction = DIR_DIAG;
+
+                // -- Boundary Conditions --
+                if (i == 0 && j == 0) {
+                    score = tileStartScore; // Score from the previous tile
+                } 
+                else if (i == 0) {
+                    score = wf_scores[pre_k + i] + GAP; // Gap from Left
+                    direction = DIR_LEFT;
+                } 
+                else if (j == 0) {
+                    score = wf_scores[pre_k + (i - 1)] + GAP; // Gap from Up
+                    direction = DIR_UP;
+                } 
+                else {
+                    // -- Inner Matrix Calculation --
+                    // TODO: Replace this global memory access with shared memory
+                    char r_char = shared_ref[i - 1];
+                    char q_char = shared_qry[j - 1];
+                    
+                    int16_t score_diag = wf_scores[prepre_k + (i - 1)] + (r_char == q_char ? MATCH : MISMATCH);
+                    int16_t score_up   = wf_scores[pre_k + (i - 1)] + GAP;
+                    int16_t score_left = wf_scores[pre_k + i] + GAP;
+                
+                    // Find Max (BONUS: Replace with DPX instructions)
+                    #if __CUDA_ARCH__ >= 900
+                        // DPX accelerated max3
+                        int best = __vimax3_s16x2(
+                            (score_diag & 0xFFFF) | (score_diag << 16),
+                            (score_up   & 0xFFFF) | (score_up   << 16),
+                            (score_left & 0xFFFF) | (score_left << 16)
+                        );
+
+                        score = (int16_t)(best & 0xFFFF);
+                    #else
+                        score = score_diag;
+                        if (score_up > score)   score = score_up;
+                        if (score_left > score) score = score_left;
+                    #endif
+
+                    // Direction (still needed for traceback)
+                    if (score == score_diag)      direction = DIR_DIAG;
+                    else if (score == score_up)   direction = DIR_UP;
+                    else                           direction = DIR_LEFT;
+                }
+
+                // Write Score
+                wf_scores[curr_k + i] = score;
+                
+                // Write Direction (Only for inner cells, shifted index)
+                if (i > 0 && j > 0) {
+                        tbDir[(i - 1) * T + (j - 1)] = direction;
+                }
+
+                // -- GACT Overlap Logic --
+                // Track the highest score in the overlap region (past T-O)
+                // TODO: Compute the max score and its indices for cells in the overlap region
+                // Sequentially, max score can be updated during iteration.
+                // For parallel execution, think about how to handle this safely.
+                // HINT: Parallel Reduction
+
+                if (!lastTile) {
+                    if (i > (refLen - O) && j > (qryLen - O)) {
+                        if (score > localMaxScore) {
+                            localMaxScore = score;
+                            localBest_i = i;
+                            localBest_j = j;
+                        }
+                    }
+                }                    
+            }
+
+            __syncthreads();
+        } // End Wavefront Loop
+
+        if (tx < BLOCK_SIZE) {
+            s_maxScore[tx] = localMaxScore;
+            s_best_i[tx]   = localBest_i;
+            s_best_j[tx]   = localBest_j;
+        }
+        __syncthreads();
+
+        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+            if (tx < stride) {
+                if (s_maxScore[tx + stride] > s_maxScore[tx]) {
+                    s_maxScore[tx] = s_maxScore[tx + stride];
+                    s_best_i[tx]   = s_best_i[tx + stride];
+                    s_best_j[tx]   = s_best_j[tx + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        // tx==0 writes the reduced result to shared state for use in traceback
+        if (tx == 0 && !lastTile) {
+            sh_next_ref_advance = s_best_i[0];
+            sh_next_qry_advance = s_best_j[0];
+        }
+        __syncthreads();
+
+        // ---------------------------------------------------
+        // TRACEBACK & REVERSAL
+        // ---------------------------------------------------
+        // HINT:
+        // 1. How many threads should be used for the traceback?
+        // 2. Consider carefully whether the variable should be stored in registers or shared memory.
+
+        if (tx == 0) {
+            sh_localLen = 0;
+
+            // Determine where to start traceback (Overlap heuristic vs End of Tile)
+            int ti = (!lastTile) ? sh_next_ref_advance : refLen;
+            int tj = (!lastTile) ? sh_next_qry_advance : qryLen;
+
+            // Carry the best overlap score into the next tile's origin cell
+            tileStartScore = (int16_t)s_maxScore[0];
+
+            // Re-store the actual advance amounts (ti/tj may equal refLen/qryLen on lastTile)
+            sh_next_ref_advance = ti;
+            sh_next_qry_advance = tj;
+
+            // Traceback Backwards (End -> Start) into Shared Memory
+            while (ti > 0 || tj > 0) {
+                uint8_t dir;
+
+                // Implicit boundary handling for top/left edges
+                if (ti == 0) { 
+                    dir = DIR_LEFT; 
+                } else if (tj == 0) { 
+                    dir = DIR_UP;   
+                } else {
+                    // Fetch direction from DP table
+                    dir = tbDir[(ti - 1) * T + (tj - 1)];
+                }
+
+                // Store to local temporary buffer
+                localPath[sh_localLen] = dir;
+                sh_localLen++;
+                
+                // Move coordinates
+                if (dir == DIR_DIAG) { ti--; tj--; } 
+                else if (dir == DIR_UP) { ti--; } 
+                else { tj--; }
+            }
+        }
+
+        __syncthreads();
+
+        // Write Forward (Start -> End) to Global Memory
+        // Reverses the local path so the CPU gets it in forward order
+        // TODO: Use memory coalescing to efficiently write the data to global memory
+        int localLen = sh_localLen;
+        int32_t currentPairPathLen = sh_currentPairPathLen;
+        for (int k = tx; k < localLen; k += blockDim.x) {
+            d_tb[tbGlobalOffset + currentPairPathLen + k] = localPath[localLen - 1 - k];
+        }
+
+        __syncthreads();
+        
+        // ---------------------------------------------------
+        // ADVANCE TO NEXT TILE
+        // ---------------------------------------------------
+        // Only thread 0 updates shared cursor variables so there
+        // is no race; all threads will see the updated values after
+        // __syncthreads() at the top of the next tile iteration
+        if (tx == 0) {
+            sh_currentPairPathLen += sh_localLen;
+            sh_reference_idx += sh_next_ref_advance;
+            sh_query_idx     += sh_next_qry_advance;
+        }
+        __syncthreads();
+        // HINT: Is __syncthreads() needed after each tile?
+        // Yes – the __syncthreads() above ensures sh_reference_idx/sh_query_idx
+        // are visible to all threads before the next tile's while-condition check.
+
+    } // End Tile Loop
+
+    // HINT: Is __syncthreads() needed after each alignment?
+    // No – each block handles exactly one pair, so no inter-pair sync is needed.
 }
 
 /** * Reconstructs the actual string alignment from the traceback paths (CIGAR-like data).
@@ -401,6 +489,7 @@ void GpuAligner::getAlignedSequences (TB_PATH& tb_paths) {
     
     // TODO: Apply parallelism to this for loop
     // HINT: Remember to add the header
+    #pragma omp parallel for
     for (int pair = 0; pair < numPairs; ++pair) {
         int tb_start = tb_length * pair;
         
@@ -464,8 +553,10 @@ void GpuAligner::clearAndReset () {
 void GpuAligner::alignment () {
 
     // TODO: make sure to appropriately set the values below
-    int numBlocks = 1;  // i.e. number of thread blocks on the GPU
-    int blockSize = 1; // i.e. number of GPU threads per thread block
+    int numBlocks = numPairs;  // i.e. number of thread blocks on the GPU
+    // printf("%d\n", numBlocks);
+    int blockSize = 256; // i.e. number of GPU threads per thread block
+    // NOTE: blockSize must match BLOCK_SIZE constant defined in the kernel above
 
     // 1. Allocate memory on Device
     allocateMem();
