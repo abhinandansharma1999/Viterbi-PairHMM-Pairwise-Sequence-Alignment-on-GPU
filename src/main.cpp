@@ -6,7 +6,7 @@
 #include <tbb/parallel_for.h>
 #include "kseq.h"
 #include "zlib.h"
-#include "alignment.cuh"
+#include "alignment.h"
 
 // For parsing the command line values
 namespace po = boost::program_options;
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     // Print GPU information
     fprintf(stdout, "Setting CPU threads to %u and printing GPU device properties.\n", numThreads);
     tbb::global_control init(tbb::global_control::max_allowed_parallelism, numThreads);
-    printGpuProperties();
+    // printGpuProperties();
 
     
     GpuAligner Aligner;

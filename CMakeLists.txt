@@ -32,8 +32,7 @@ endif()
 
 add_executable (aligner
     src/main.cpp
-    src/alignment.cu
-    src/gpuProperty.cu
+    src/alignment.cpp
 )
 
 add_executable (compare_alignment
