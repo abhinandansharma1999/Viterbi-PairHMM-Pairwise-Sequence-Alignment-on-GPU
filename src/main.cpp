@@ -6,7 +6,7 @@
 #include <tbb/parallel_for.h>
 #include "kseq.h"
 #include "zlib.h"
-#include "alignment.h"
+#include "alignment.cuh"
 
 // For parsing the command line values
 namespace po = boost::program_options;
