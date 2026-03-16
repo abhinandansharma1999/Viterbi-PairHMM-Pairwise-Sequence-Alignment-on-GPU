@@ -6,9 +6,6 @@
 
 void printGpuProperties();
 
-// Tile size — shared between host and device code
-#define T_TILE 200
-
 using TB_PATH = std::vector<uint8_t>;
 
 struct Sequence {
@@ -28,8 +25,6 @@ struct GpuAligner {
     uint8_t* d_tb;
     int32_t* d_seqLen;
     int32_t* d_info;
-    uint8_t* d_tbDir;    // tile scratch: 3 * T_TILE * T_TILE, global device mem
-    uint8_t* d_tbState;  // tile scratch: 3 * T_TILE * T_TILE, global device mem
 
     void alignment();
     void allocateMem();

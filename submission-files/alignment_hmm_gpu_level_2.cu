@@ -7,6 +7,9 @@
 
 // =============================================================================
 // CUDA error checking macro
+//
+// Wraps any CUDA API call. On failure prints file, line, and error string
+// to stderr then exits. Usage: CUDA_CHECK(cudaMalloc(...));
 // =============================================================================
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -18,11 +21,16 @@
         }                                                                       \
     } while(0)
 
-// Must match blockSize in alignment()
+// Number of threads per block — must match the blockSize passed to the kernel launch.
+// 256 threads = 8 warps per block. On the A30 (56 SMs, 48 KB shared mem/block),
+// this yields 2 blocks/SM, giving 512 threads/SM active at once.
 #define BLOCK_SIZE 256
 
 // =============================================================================
 // allocateMem  — identical to HMM 1-thread
+//
+// Same allocations as Level 1: d_tbDir and d_tbState are numPairs * 3 * T * T
+// so each block has its own private traceback scratch region.
 // =============================================================================
 void GpuAligner::allocateMem() {
     longestLen = std::max_element(seqs.begin(), seqs.end(),
@@ -32,22 +40,24 @@ void GpuAligner::allocateMem() {
 
     cudaError_t err;
 
+    // Flat packed sequence array: all sequences zero-padded to longestLen bytes
     err = cudaMalloc(&d_seqs, numPairs * 2 * longestLen * sizeof(char));
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Actual (unpadded) lengths — 2 per pair (ref, qry)
     err = cudaMalloc(&d_seqLen, numPairs * 2 * sizeof(int32_t));
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Output traceback buffer: worst-case 2*longestLen direction codes per pair
     int tb_length = longestLen << 1;
     err = cudaMalloc(&d_tb, numPairs * tb_length * sizeof(uint8_t));
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Two-element info array passed into the kernel: [numPairs, longestLen]
     err = cudaMalloc(&d_info, 2 * sizeof(int32_t));
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
     // Each pair (block) needs its own 3*T*T scratch — per NW parallel pattern
-    // Note: d_tbDir is allocated but never written for inner cells in this version
-    // (see kernel comments). It is kept here to avoid changing the header/interface.
     err = cudaMalloc(&d_tbDir,   (size_t)numPairs * 3 * T_TILE * T_TILE * sizeof(uint8_t));
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
@@ -57,10 +67,13 @@ void GpuAligner::allocateMem() {
 
 // =============================================================================
 // transferSequence2Device  — identical to HMM 1-thread
+//
+// Packs sequences into flat device arrays and zero-initialises d_tb.
 // =============================================================================
 void GpuAligner::transferSequence2Device() {
     cudaError_t err;
 
+    // Build flat host array: each sequence zero-padded to longestLen
     std::vector<char> h_seqs(longestLen * numPairs * 2, 0);
     for (size_t i = 0; i < (size_t)(numPairs * 2); ++i) {
         const std::string& s = seqs[i].seq;
@@ -70,18 +83,21 @@ void GpuAligner::transferSequence2Device() {
                      longestLen * numPairs * 2 * sizeof(char), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Copy actual sequence lengths
     std::vector<int32_t> h_seqLen(numPairs * 2, 0);
     for (int i = 0; i < numPairs * 2; ++i) h_seqLen[i] = seqs[i].seq.size();
     err = cudaMemcpy(d_seqLen, h_seqLen.data(),
                      numPairs * 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Zero-initialise traceback buffer — 0 is the end-of-path sentinel
     int tb_length = longestLen << 1;
     std::vector<uint8_t> h_tb(tb_length * numPairs, 0);
     err = cudaMemcpy(d_tb, h_tb.data(),
                      tb_length * numPairs * sizeof(uint8_t), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR: %s\n", cudaGetErrorString(err)); exit(1); }
 
+    // Copy info array: [numPairs, longestLen]
     std::vector<int32_t> h_info(2);
     h_info[0] = numPairs;
     h_info[1] = longestLen;
@@ -91,6 +107,8 @@ void GpuAligner::transferSequence2Device() {
 
 // =============================================================================
 // transferTB2Host  — identical to HMM 1-thread
+//
+// Copies the completed traceback paths from GPU to host for getAlignedSequences.
 // =============================================================================
 TB_PATH GpuAligner::transferTB2Host() {
     int tb_length = longestLen << 1;
@@ -119,48 +137,52 @@ TB_PATH GpuAligner::transferTB2Host() {
 #define NEG_INF_D         -1e18                  // log(0) — unreachable state sentinel
 
 // T_TILE defined in alignment.cuh (= 200)
+// O_TILE: size of the overlap corner scanned at end of each non-final tile
 #define O_TILE 64
 
 // =============================================================================
-// alignmentOnGPU — Level 1 + Level 2 + Level 3 optimisation
+// alignmentOnGPU — Level 1 + Level 2 parallelism
 //
-// This version is identical to Level 2 except for one key optimisation:
+// LEVEL 1 — Inter-pair parallelism (same as Level 1 file):
+//   pair = blockIdx.x. All pairs run simultaneously, one block each.
 //
-// LEVEL 3 CHANGE — Eliminate redundant tbDir writes for inner cells
-// -----------------------------------------------------------------
-// In Level 2, every inner cell wrote 6 values to global memory:
-//   tbDir[S_M], tbDir[S_I], tbDir[S_D]   — 3 direction writes
-//   tbState[S_M], tbState[S_I], tbState[S_D] — 3 predecessor writes
+// LEVEL 2 — Intra-pair wavefront parallelism (NEW in this version):
+//   Within each block, the 256 threads split the cells of each anti-diagonal
+//   among themselves. Thread tx handles cells i = i_start + tx, i_start + tx
+//   + blockDim.x, ... on diagonal k. A __syncthreads() after each diagonal
+//   ensures all writes to wf_M/I/D are visible before the next diagonal reads.
 //
-// The direction for inner cells is NOT data-dependent — it is always fixed
-// by the HMM state alone:
-//   State M → always DIR_DIAG  (diagonal predecessor)
-//   State I → always DIR_LEFT  (leftward predecessor)
-//   State D → always DIR_UP    (upward predecessor)
+// SHARED MEMORY ADDITIONS OVER LEVEL 1
+// -------------------------------------
+//   shared_ref / shared_qry : tile's sequence segments loaded cooperatively
+//     once per tile, then read from fast shared memory by all threads.
+//   s_bestScore / s_best_ti / s_best_tj / s_best_st : per-thread overlap
+//     accumulators written after the wavefront loop, then tree-reduced to find
+//     the global best overlap cell for the tile.
+//   sh_* tile-boundary scalars : promoted from thread-local registers (Level 1)
+//     to __shared__ so all 256 threads can read them each iteration.
 //
-// This is a structural property of the HMM: each state can only be reached
-// by one type of move. So storing tbDir for inner cells is pure redundancy.
+// TILE-BOUNDARY SCALARS MUST NOW BE __shared__
+// ---------------------------------------------
+//   In Level 1 there was only one thread per block, so scalars like lastTile
+//   and carryLogProb lived in registers. With 256 threads, every thread needs
+//   to read them — they are written by tx==0 and broadcast via shared memory +
+//   __syncthreads(), the same pattern used in the NW GPU reference.
 //
-// The fix has two parts:
-//   1. WRITE side (wavefront): drop all 3 tbDir writes for inner cells.
-//      Only tbState (the predecessor state) needs to be written — 3 writes
-//      instead of 6, cutting inner-cell global write traffic by 50%.
+// OVERLAP REDUCTION
+// -----------------
+//   Each thread accumulates its own local best (localBestScore/ti/tj/st) in
+//   registers during the wavefront loop — no shared memory contention. After
+//   the loop, all threads write their local best to s_bestScore[tx] etc., then
+//   a standard log-2 tree reduction finds the global best in O(log BLOCK_SIZE)
+//   steps. The tie-breaking rule (>= with state priority S_D > S_I > S_M) must
+//   match the single-thread sequential behaviour exactly to preserve correctness.
 //
-//   2. READ side (traceback): instead of reading tbDir[cur_state * CELL + cell]
-//      to get the direction, derive it from cur_state directly via a register
-//      branch. This replaces one random global memory read per traceback step
-//      with a free comparison.
-//
-// Boundary cells (i==0 or j==0) are handled as before — tbDir is still
-// written there since the boundary-row logic is in a separate branch and
-// was already only writing tbState. The d_tbDir buffer is still allocated
-// to avoid interface changes, but is never written for inner cells.
-//
-// PERFORMANCE IMPACT:
-//   The wavefront inner loop runs ~400 diagonals × ~200 cells × ~100 tiles
-//   per long pair. Eliminating 3 of 6 global writes per cell halves the
-//   global memory write bandwidth in the hottest code path, yielding
-//   approximately a 1.8× speedup over Level 2.
+// TRACEBACK AND PATH WRITE
+// ------------------------
+//   Traceback is serial (tx==0 only) — each step depends on the previous.
+//   Once tx==0 fills localPath[] in reverse, all 256 threads cooperate on a
+//   coalesced write to d_tb by striding: for(k=tx; k<localLen; k+=blockDim.x).
 // =============================================================================
 
 __global__ void alignmentOnGPU(
@@ -168,8 +190,8 @@ __global__ void alignmentOnGPU(
     int32_t* d_seqLen,     // actual lengths, 2 entries per pair
     char*    d_seqs,       // flat packed sequences, stride=longestLen
     uint8_t* d_tb,         // output: traceback direction codes per pair
-    uint8_t* d_tbDir,      // global scratch: allocated but NOT written for inner cells
-    uint8_t* d_tbState)    // global scratch: numPairs * 3 * T_TILE * T_TILE (written for all cells)
+    uint8_t* d_tbDir,      // global scratch: numPairs * 3 * T_TILE * T_TILE
+    uint8_t* d_tbState)    // global scratch: numPairs * 3 * T_TILE * T_TILE
 {
     // Level 1: one block per pair
     const int pair = blockIdx.x;
@@ -181,23 +203,25 @@ __global__ void alignmentOnGPU(
     const uint8_t DIR_UP   = 2;   // deletion: only ref advances (gap in query)
     const uint8_t DIR_LEFT = 3;   // insertion: only query advances (gap in ref)
     const int S_M = 0, S_I = 1, S_D = 2;
-    const int CELL = T_TILE * T_TILE;
+    const int CELL = T_TILE * T_TILE;  // stride between state planes in tbDir/tbState
 
-    const int32_t maxSeqLen = d_info[1];
+    const int32_t maxSeqLen = d_info[1];  // = longestLen, stride in d_seqs
 
     // Per-pair scratch in global memory — offset by pair (same as Level 1)
     uint8_t* tbDir   = d_tbDir   + (size_t)pair * 3 * CELL;
     uint8_t* tbState = d_tbState + (size_t)pair * 3 * CELL;
 
     // ------------------------------------------------------------------
-    // Shared memory — identical layout to Level 2
+    // Shared memory
     // ------------------------------------------------------------------
     // Wavefront score buffers (cyclic triple-buffer)
+    // Each holds T_TILE+1 doubles for 3 diagonal slots — ~14.4 KB total
     __shared__ double  wf_M[3 * (T_TILE + 1)];
     __shared__ double  wf_I[3 * (T_TILE + 1)];
     __shared__ double  wf_D[3 * (T_TILE + 1)];
 
     // Sequence cache — loaded once per tile (same as NW shared_ref/shared_qry)
+    // Avoids repeated global memory reads: all threads read from fast shared mem
     __shared__ char    shared_ref[T_TILE];
     __shared__ char    shared_qry[T_TILE];
 
@@ -206,48 +230,53 @@ __global__ void alignmentOnGPU(
 
     // Per-thread overlap accumulator arrays —
     // same pattern as NW s_maxScore[BLOCK_SIZE]/s_best_i/s_best_j
+    // Written after wavefront loop; consumed by tree reduction
     __shared__ double  s_bestScore[BLOCK_SIZE];
     __shared__ int32_t s_best_ti  [BLOCK_SIZE];
     __shared__ int32_t s_best_tj  [BLOCK_SIZE];
     __shared__ int32_t s_best_st  [BLOCK_SIZE];
 
     // Tile-boundary scalars — same pattern as NW sh_* variables
-    __shared__ bool    sh_lastTile;
-    __shared__ double  sh_carryLogProb;
-    __shared__ int32_t sh_reference_idx;
-    __shared__ int32_t sh_query_idx;
-    __shared__ int32_t sh_currentPairPathLen;
-    __shared__ int32_t sh_localLen;
-    __shared__ int32_t sh_next_ref_advance;
-    __shared__ int32_t sh_next_qry_advance;
-    __shared__ int32_t sh_best_state;   // final best state after reduction
+    // Written by tx==0, read by all threads. Must be __shared__ (unlike Level 1
+    // where they were thread-local registers) because all 256 threads need them.
+    __shared__ bool    sh_lastTile;           // true when this tile reaches end of both sequences
+    __shared__ double  sh_carryLogProb;       // best overlap score seeding next tile's (0,0)
+    __shared__ int32_t sh_reference_idx;      // current tile start in the reference
+    __shared__ int32_t sh_query_idx;          // current tile start in the query
+    __shared__ int32_t sh_currentPairPathLen; // total direction codes written so far for this pair
+    __shared__ int32_t sh_localLen;           // number of steps in this tile's traceback path
+    __shared__ int32_t sh_next_ref_advance;   // how far to advance reference_idx after this tile
+    __shared__ int32_t sh_next_qry_advance;   // how far to advance query_idx after this tile
+    __shared__ int32_t sh_best_state;         // final best state after reduction
 
     // Init shared scalars — tx==0 only, then sync (same as NW)
     if (tx == 0) {
         sh_lastTile           = false;
-        sh_carryLogProb       = 0.0;   // log(1) neutral seed for first tile
+        sh_carryLogProb       = 0.0;   // log(1) — neutral seed for the first tile
         sh_reference_idx      = 0;
         sh_query_idx          = 0;
         sh_currentPairPathLen = 0;
     }
     __syncthreads();
 
-    const int32_t refStart       = (pair * 2)     * maxSeqLen;
-    const int32_t qryStart       = (pair * 2 + 1) * maxSeqLen;
-    const int32_t tbGlobalOffset = pair * (maxSeqLen * 2);
-    const int32_t refTotalLen    = d_seqLen[2 * pair];
-    const int32_t qryTotalLen    = d_seqLen[2 * pair + 1];
+    // Byte offsets into d_seqs and d_tb for this pair — computed once, used every tile
+    const int32_t refStart       = (pair * 2)     * maxSeqLen;  // reference sequence start
+    const int32_t qryStart       = (pair * 2 + 1) * maxSeqLen;  // query sequence start
+    const int32_t tbGlobalOffset = pair * (maxSeqLen * 2);       // traceback path start in d_tb
+    const int32_t refTotalLen    = d_seqLen[2 * pair];           // full reference length
+    const int32_t qryTotalLen    = d_seqLen[2 * pair + 1];       // full query length
 
     // -----------------------------------------------------------------------
     // TILE LOOP
     // -----------------------------------------------------------------------
     while (!sh_lastTile) {
 
-        // All threads read tile-boundary scalars into registers
+        // All threads read tile-boundary scalars into registers for this iteration
         const int32_t reference_idx = sh_reference_idx;
         const int32_t query_idx     = sh_query_idx;
         const double  carryLogProb  = sh_carryLogProb;
 
+        // Clamp tile dimensions to remaining sequence lengths
         const int32_t refLen = min(T_TILE, (int)(refTotalLen - reference_idx));
         const int32_t qryLen = min(T_TILE, (int)(qryTotalLen - query_idx));
 
@@ -257,7 +286,10 @@ __global__ void alignmentOnGPU(
                 (query_idx     + qryLen == qryTotalLen))
                 sh_lastTile = true;
         }
-        __syncthreads();   // all threads must see sh_lastTile before overlap tracking — strided across all threads, same as NW wf_scores init
+        __syncthreads();   // all threads must see sh_lastTile before overlap tracking uses it
+
+        // Init wf buffers — strided across all threads, same as NW wf_scores init
+        // Each thread initialises every (BLOCK_SIZE)-th element for efficiency
         for (int s = tx; s < 3 * (T_TILE + 1); s += blockDim.x) {
             wf_M[s] = NEG_INF_D;
             wf_I[s] = NEG_INF_D;
@@ -266,6 +298,7 @@ __global__ void alignmentOnGPU(
         __syncthreads();
 
         // Load sequence segments into shared memory — same as NW shared_ref/shared_qry load
+        // All threads cooperate so each thread loads one element
         for (int s = tx; s < refLen; s += blockDim.x)
             shared_ref[s] = d_seqs[refStart + reference_idx + s];
         for (int s = tx; s < qryLen; s += blockDim.x)
@@ -273,6 +306,8 @@ __global__ void alignmentOnGPU(
         __syncthreads();
 
         // Per-thread local overlap best — registers, same as NW localMaxScore/localBest_i/j
+        // Each thread tracks the best cell it personally computed — no shared memory writes
+        // during the hot wavefront loop. Results are merged by reduction afterward.
         double  localBestScore = NEG_INF_D;
         int32_t localBest_ti   = refLen;
         int32_t localBest_tj   = qryLen;
@@ -284,6 +319,12 @@ __global__ void alignmentOnGPU(
         // using "i = i_start + tx; i <= i_end; i += blockDim.x"
         // exactly as in NW.
         // __syncthreads() at end of each diagonal — same as NW.
+        //
+        // WHY SYNC AFTER EVERY DIAGONAL:
+        //   Cell (i,j) on diagonal k reads wf_M/I/D values from diagonals k-1
+        //   and k-2. Those values were written by potentially different threads
+        //   on the previous iteration. Without a barrier, a thread could start
+        //   reading diagonal k-1 before another thread has finished writing it.
         // -------------------------------------------------------------------
         for (int k = 0; k <= refLen + qryLen; ++k) {
 
@@ -291,10 +332,12 @@ __global__ void alignmentOnGPU(
             const int pre_k    = ((k+2) % 3) * (T_TILE + 1);  // diagonal k-1
             const int prepre_k = ((k+1) % 3) * (T_TILE + 1);  // diagonal k-2
 
+            // Valid i range for this anti-diagonal (j = k-i must be in [0, qryLen])
             const int i_start = max(0,           k - (int)qryLen);
             const int i_end   = min((int)refLen, k);
 
             // Level 2: stride across diagonal cells — same as NW
+            // Thread tx handles i = i_start+tx, i_start+tx+256, ...
             for (int i = i_start + tx; i <= i_end; i += blockDim.x) {
                 int j = k - i;
 
@@ -305,25 +348,27 @@ __global__ void alignmentOnGPU(
                 uint8_t pre_d = (uint8_t)S_M;
 
                 if (i == 0 && j == 0) {
-                    // Tile origin: seed from carry-in
+                    // Tile origin: seed all three states from the carry-in score
                     vm = carryLogProb + LOG_INIT_M;
                     vi = carryLogProb + LOG_INIT_I;
                     vd = carryLogProb + LOG_INIT_D;
                 }
                 else if (i == 0) {
+                    // Top boundary: only I active (query gap)
                     double fMI = wf_M[pre_k + 0] + LOG_MI;
                     double fII = wf_I[pre_k + 0] + LOG_II;
                     if (fMI >= fII) { vi = fMI; pre_i = (uint8_t)S_M; }
                     else            { vi = fII; pre_i = (uint8_t)S_I; }
-                    // Only tbState needed on boundary — direction is always DIR_LEFT for I
+                    tbDir  [S_I * CELL + 0 * T_TILE + (j-1)] = DIR_LEFT;
                     tbState[S_I * CELL + 0 * T_TILE + (j-1)] = pre_i;
                 }
                 else if (j == 0) {
+                    // Left boundary: only D active (ref gap)
                     double fMD = wf_M[pre_k + (i-1)] + LOG_MD;
                     double fDD = wf_D[pre_k + (i-1)] + LOG_DD;
                     if (fMD >= fDD) { vd = fMD; pre_d = (uint8_t)S_M; }
                     else            { vd = fDD; pre_d = (uint8_t)S_D; }
-                    // Only tbState needed on boundary — direction is always DIR_UP for D
+                    tbDir  [S_D * CELL + (i-1) * T_TILE + 0] = DIR_UP;
                     tbState[S_D * CELL + (i-1) * T_TILE + 0] = pre_d;
                 }
                 else {
@@ -352,14 +397,11 @@ __global__ void alignmentOnGPU(
                     if (dMD >= dDD) { vd = dMD; pre_d = S_M; }
                     else            { vd = dDD; pre_d = S_D; }
 
+                    // Write traceback entries for all three states at this inner cell
                     int cell = (i-1) * T_TILE + (j-1);
-                    // tbDir not stored — direction for inner cells is always fixed by state:
-                    // M→DIR_DIAG, I→DIR_LEFT, D→DIR_UP. Derived in traceback from cur_state.
-                    // Only tbState (predecessor) needs to be stored.
-                    // This eliminates 3 global writes per inner cell vs. Level 2.
-                    tbState[S_M * CELL + cell] = pre_m;
-                    tbState[S_I * CELL + cell] = pre_i;
-                    tbState[S_D * CELL + cell] = pre_d;
+                    tbDir  [S_M * CELL + cell] = DIR_DIAG; tbState[S_M * CELL + cell] = pre_m;
+                    tbDir  [S_I * CELL + cell] = DIR_LEFT; tbState[S_I * CELL + cell] = pre_i;
+                    tbDir  [S_D * CELL + cell] = DIR_UP;   tbState[S_D * CELL + cell] = pre_d;
                 }
 
                 // Commit scores to the current wavefront slot
@@ -369,6 +411,8 @@ __global__ void alignmentOnGPU(
                 // ---- ^^^ END VERBATIM HMM SCORING ^^^ ----
 
                 // Update thread-local overlap best — registers only, same as NW localMaxScore
+                // Uses >= with s going 0->2, so on equal score S_D(2) beats S_I(1) beats S_M(0)
+                // exactly matching the 1-thread single-pass behaviour.
                 if (!sh_lastTile &&
                     i > (refLen - O_TILE) && j > (qryLen - O_TILE)) {
                     double scores[3] = {vm, vi, vd};
@@ -385,6 +429,7 @@ __global__ void alignmentOnGPU(
             } // end inner i loop
 
             // Sync after each diagonal — same as NW
+            // Mandatory: next diagonal reads wf values written by this diagonal
             __syncthreads();
 
         } // end wavefront loop
@@ -394,9 +439,15 @@ __global__ void alignmentOnGPU(
         //
         // Step 1: each thread writes its local best to shared arrays
         // Step 2: __syncthreads()
-        // Step 3: tree reduction — stride starts at BLOCK_SIZE/2, halves each round
+        // Step 3: tree reduction — each round halves the active thread count
+        //         using a stride that starts at BLOCK_SIZE/2 and shifts right
         // Step 4: tx==0 writes result to sh_next_ref/qry_advance and sh_best_state
         // Step 5: __syncthreads()
+        //
+        // TIE-BREAKING:
+        //   The 1-thread loop iterates states s=0,1,2 with >=, meaning the last
+        //   state seen wins on a tie: S_D(2) > S_I(1) > S_M(0). The reduction
+        //   must replicate this by preferring higher s_best_st on equal scores.
         // -------------------------------------------------------------------
         s_bestScore[tx] = localBestScore;
         s_best_ti  [tx] = localBest_ti;
@@ -406,8 +457,10 @@ __global__ void alignmentOnGPU(
 
         for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
             if (tx < stride) {
-                // Tie-break: on equal scores, prefer higher state index (S_D > S_I > S_M)
-                // to match the single-thread >= iteration with s going 0,1,2
+                // Match 1-thread tie-break exactly:
+                // The 1-thread loop iterates s=0,1,2 with >=, so on equal scores
+                // the last state wins: S_D(2) > S_I(1) > S_M(0).
+                // In the reduction, on equal scores we prefer higher s_best_st.
                 bool take = (s_bestScore[tx + stride] > s_bestScore[tx]) ||
                             (s_bestScore[tx + stride] == s_bestScore[tx] &&
                              s_best_st[tx + stride] >= s_best_st[tx]);
@@ -421,7 +474,8 @@ __global__ void alignmentOnGPU(
             __syncthreads();
         }
 
-        // tx==0 writes the reduced result to shared scalars for all threads to see
+        // tx==0 writes the reduced result — same as NW tx==0 writing sh_next_ref/qry_advance
+        // After this, s_bestScore[0]/s_best_ti[0]/s_best_tj[0]/s_best_st[0] hold the global best
         if (tx == 0 && !sh_lastTile) {
             sh_next_ref_advance = s_best_ti[0];
             sh_next_qry_advance = s_best_tj[0];
@@ -432,21 +486,19 @@ __global__ void alignmentOnGPU(
         // -------------------------------------------------------------------
         // TRACEBACK — tx==0 only, verbatim from HMM 1-thread
         //
-        // LEVEL 3 CHANGE in the traceback walk:
-        //   In Level 2, the inner cell branch read dir = tbDir[cur_state*CELL+cell]
-        //   from global memory. Here, dir is derived from cur_state directly:
-        //     cur_state == S_M → dir = DIR_DIAG
-        //     cur_state == S_I → dir = DIR_LEFT
-        //     cur_state == S_D → dir = DIR_UP
-        //   This replaces one random global memory read per step with a free
-        //   register comparison — no change in correctness.
+        // Traceback is inherently serial (each step depends on the previous),
+        // so only thread 0 executes it. Other threads wait at the syncthreads
+        // below. The resulting path is stored in localPath[] (reversed), then
+        // all threads cooperate on the coalesced write to d_tb.
         // -------------------------------------------------------------------
         if (tx == 0) {
             sh_localLen = 0;
 
+            // Start from best overlap cell (non-final tile) or terminal cell (final tile)
             int ti = (!sh_lastTile) ? sh_next_ref_advance : (int)refLen;
             int tj = (!sh_lastTile) ? sh_next_qry_advance : (int)qryLen;
 
+            // Lock in the advance distances before traceback modifies ti/tj
             sh_next_ref_advance = ti;
             sh_next_qry_advance = tj;
 
@@ -477,47 +529,36 @@ __global__ void alignmentOnGPU(
                 else if (fD > fM)        cur_state = S_D;
             }
 
-            // Traceback walk — direction derived from cur_state (no tbDir read needed)
-            // M→DIR_DIAG, I→DIR_LEFT, D→DIR_UP always for inner cells.
-            // Boundary cases (ti==0 or tj==0) are handled separately as before.
+            // Traceback walk — verbatim from HMM 1-thread
             while (ti > 0 || tj > 0) {
                 uint8_t dir;
                 int     prev_state;
 
                 if (ti == 0) {
-                    // Top boundary — forced DIR_LEFT, state is I
                     dir        = DIR_LEFT;
                     prev_state = (int)tbState[S_I * CELL + 0 * T_TILE + (tj-1)];
                     tj--;
                 } else if (tj == 0) {
-                    // Left boundary — forced DIR_UP, state is D
                     dir        = DIR_UP;
                     prev_state = (int)tbState[S_D * CELL + (ti-1) * T_TILE + 0];
                     ti--;
                 } else {
-                    // Inner cell — direction always determined by cur_state, no tbDir read
-                    // This is the Level 3 change: replaces a global memory read with a branch
-                    int cell = (ti-1) * T_TILE + (tj-1);
-                    if (cur_state == S_M) {
-                        dir = DIR_DIAG;
-                        ti--; tj--;
-                    } else if (cur_state == S_I) {
-                        dir = DIR_LEFT;
-                        tj--;
-                    } else {
-                        dir = DIR_UP;
-                        ti--;
-                    }
-                    prev_state = (int)tbState[cur_state * CELL + cell];
+                    int cell   = (ti-1) * T_TILE + (tj-1);
+                    dir        = tbDir  [cur_state * CELL + cell];
+                    prev_state = tbState[cur_state * CELL + cell];
+                    if      (dir == DIR_DIAG) { ti--; tj--; }
+                    else if (dir == DIR_UP)   { ti--;        }
+                    else                      {       tj--;  }
                 }
 
-                localPath[sh_localLen++] = dir;   // collected in reverse
-                cur_state = prev_state;             // follow predecessor state
+                localPath[sh_localLen++] = dir;
+                cur_state = prev_state;
             }
         } // end tx==0 traceback
         __syncthreads();
 
         // Coalesced write of reversed path to global memory — same as NW
+        // All 256 threads write different elements of localPath[] simultaneously
         int localLen             = sh_localLen;
         int32_t currentPathStart = sh_currentPairPathLen;
         for (int k = tx; k < localLen; k += blockDim.x) {
@@ -538,16 +579,22 @@ __global__ void alignmentOnGPU(
 
 // =============================================================================
 // getAlignedSequences — identical to HMM 1-thread
+//
+// Reconstructs gapped alignment strings from the traceback path:
+//   DIR_DIAG (1): consume one base from each sequence
+//   DIR_UP   (2): consume one ref base, insert '-' into query alignment
+//   DIR_LEFT (3): insert '-' into ref alignment, consume one query base
+//   0:            end-of-path sentinel — stop
 // =============================================================================
 void GpuAligner::getAlignedSequences(TB_PATH& tb_paths) {
     const uint8_t DIR_DIAG = 1;
     const uint8_t DIR_UP   = 2;
     const uint8_t DIR_LEFT = 3;
 
-    int tb_length = longestLen << 1;
+    int tb_length = longestLen << 1;  // allocated path length per pair
 
     for (int pair = 0; pair < numPairs; ++pair) {
-        int tb_start = tb_length * pair;
+        int tb_start = tb_length * pair;  // offset into tb_paths for this pair
         int seqId0   = 2 * pair;
         int seqId1   = 2 * pair + 1;
         std::string seq0 = seqs[seqId0].seq;
@@ -569,6 +616,8 @@ void GpuAligner::getAlignedSequences(TB_PATH& tb_paths) {
 
 // =============================================================================
 // clearAndReset — identical to HMM 1-thread
+//
+// Frees all GPU device memory and resets the aligner for the next batch.
 // =============================================================================
 void GpuAligner::clearAndReset() {
     cudaFree(d_seqs);
@@ -584,6 +633,10 @@ void GpuAligner::clearAndReset() {
 
 // =============================================================================
 // alignment — numPairs blocks, BLOCK_SIZE threads each
+//
+// Launches numPairs blocks of 256 threads. Each block handles one pair
+// (Level 1) and within each block all 256 threads collaborate on the
+// wavefront anti-diagonals (Level 2).
 // =============================================================================
 void GpuAligner::alignment() {
     const int numBlocks = numPairs;
@@ -608,6 +661,9 @@ void GpuAligner::alignment() {
 
 // =============================================================================
 // writeAlignment — identical to HMM 1-thread
+//
+// Writes all aligned sequences to a FASTA file.
+// append=true for multi-batch output to the same file.
 // =============================================================================
 void GpuAligner::writeAlignment(std::string fileName, bool append) {
     std::ofstream outFile;
